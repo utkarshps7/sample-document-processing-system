@@ -1,0 +1,33 @@
+@using Microsoft.AspNetCore.Http
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <base href="/" />
+    @* Site.Master <head> links, in their original order. *@
+    <link rel="stylesheet" href="@Assets["Content/bootstrap.min.css"]" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" />
+    @* MapStaticAssets fingerprinting replaces the legacy ?v=<last-write-ticks> cache buster. *@
+    <link id="SiteStylesheet" rel="stylesheet" href="@Assets["Content/Site.css"]" />
+    <link rel="icon" type="image/png" href="@Assets["favicon.png"]" />
+    <ImportMap />
+    <HeadOutlet @rendermode="PageRenderMode" />
+</head>
+<body>
+    <Routes @rendermode="PageRenderMode" />
+    @* [PORT-NOTE] The Web Forms ScriptManager (Microsoft AJAX runtime) is not loaded; Blazor replaces it. *@
+    <script src="@Assets["Scripts/bootstrap.bundle.min.js"]"></script>
+    <script src="_framework/blazor.web.js"></script>
+</body>
+</html>
+
+@code {
+    [CascadingParameter]
+    private HttpContext HttpContext { get; set; } = default!;
+
+    // Interactive server rendering for every page, except a page marked
+    // [ExcludeFromInteractiveRouting], which renders statically on its HTTP request.
+    private IComponentRenderMode? PageRenderMode =>
+        HttpContext.AcceptsInteractiveRouting() ? InteractiveServer : null;
+}

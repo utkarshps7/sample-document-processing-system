@@ -1,0 +1,51 @@
+@page "/Error"
+@page "/ErrorPage"
+@page "/ErrorPage.aspx"
+@attribute [ExcludeFromInteractiveRouting]
+@using global::Microsoft.AspNetCore.Diagnostics
+
+<PageTitle>Something went wrong</PageTitle>
+
+<div class="empty-state">
+    <h1>@headingText</h1>
+    <p>@messageText</p>
+    <a href="/" class="btn-brand">Back to documents</a>
+</div>
+
+@code {
+    // Present while the page is rendered on an HTTP request (UseExceptionHandler /
+    // UseStatusCodePagesWithReExecute re-execute the pipeline into this component).
+    [CascadingParameter]
+    private HttpContext? HttpContext { get; set; }
+
+    // Legacy customErrors redirected to ~/ErrorPage.aspx?code=404; Program.cs should re-execute
+    // with UseStatusCodePagesWithReExecute("/Error", "?code={0}") so the same query value arrives.
+    [SupplyParameterFromQuery(Name = "code")]
+    private string? Code { get; set; }
+
+    private string headingText = string.Empty;
+    private string messageText = string.Empty;
+
+    protected override void OnParametersSet()
+    {
+        var code = Code;
+
+        // When re-executed by the status-code middleware without a query string, fall back to
+        // the original status code recorded on the request.
+        if (string.IsNullOrEmpty(code) && HttpContext?.Features.Get<IStatusCodeReExecuteFeature>() is { } reExecute)
+        {
+            code = reExecute.OriginalStatusCode.ToString();
+        }
+
+        if (code == "404")
+        {
+            headingText = "404 - Page Not Found";
+            messageText = "Sorry, there's nothing at this address.";
+        }
+        else
+        {
+            headingText = "Something went wrong";
+            messageText = "The error has been written to the application trace log.";
+        }
+    }
+}

@@ -1,0 +1,85 @@
+@inherits LayoutComponentBase
+@using System.Reflection
+@using System.Runtime.Versioning
+@using DocumentProcessor.WebForms.Data
+@using Microsoft.Extensions.DependencyInjection
+
+@* Default for the legacy TitleContent placeholder; a page that emits its own <PageTitle> overrides it. *@
+<PageTitle>Document Processor</PageTitle>
+
+
+<header class="app-bar">
+    <div class="app-brand">
+        <span class="app-brand-mark"><i class="bi bi-stars"></i></span>
+        <span>Document Processor</span>
+    </div>
+
+    @* Reports the engine the app is actually connected to; flips to the PostgreSQL
+       styling once the connection string points at Aurora. *@
+    <div class="app-bar-pills">
+        <span class="runtime-pill">
+            <i class="bi bi-cpu"></i>
+            @runtimePillText
+        </span>
+        <span id="ctl00_DatabasePill" class="@databasePillClass">
+            <i id="ctl00_DatabasePillIcon" class="@databasePillIconClass"></i>
+            @databasePillText
+        </span>
+    </div>
+</header>
+
+<main class="app-main">
+    @Body
+</main>
+
+<footer class="app-footer">
+    Config: @credentialSourceText
+    <span class="app-footer-separator">&middot;</span>
+    Summaries stored in @providerNameText
+</footer>
+
+@code {
+    [Inject]
+    private IServiceProvider Services { get; set; } = default!;
+
+    private string runtimePillText = string.Empty;
+    private string databasePillClass = "db-pill";
+    private string databasePillIconClass = "bi bi-database";
+    private string databasePillText = string.Empty;
+    private string credentialSourceText = string.Empty;
+    private string providerNameText = string.Empty;
+
+    protected override void OnInitialized()
+    {
+        runtimePillText = FrameworkName();
+
+        var info = Services.GetService<DatabaseInfo>();
+
+        if (info == null)
+        {
+            databasePillText = "Database not resolved";
+            credentialSourceText = "unavailable";
+            providerNameText = "no database";
+            return;
+        }
+
+        var isPostgres = info.Provider == DatabaseProvider.PostgreSql;
+
+        databasePillClass = isPostgres ? "db-pill db-pill-postgres" : "db-pill";
+        databasePillIconClass = isPostgres ? "bi bi-rocket-takeoff-fill" : "bi bi-database";
+
+        // Razor encodes these on output, replacing the legacy Server.HtmlEncode calls.
+        databasePillText = info.DisplayName + " · " + info.LocationLabel;
+        credentialSourceText = info.CredentialSource;
+        providerNameText = info.DisplayName;
+    }
+
+    /// <summary>The framework the app was compiled for, e.g. ".NET 10.0".</summary>
+    private static string FrameworkName()
+    {
+        var target = typeof(MainLayout).Assembly.GetCustomAttribute<TargetFrameworkAttribute>();
+        return target != null && !string.IsNullOrEmpty(target.FrameworkDisplayName)
+            ? target.FrameworkDisplayName
+            : ".NET";
+    }
+}

@@ -1,0 +1,410 @@
+@page "/"
+@page "/Default"
+@page "/Default.aspx"
+@rendermode InteractiveServer
+@implements IDisposable
+@using System.IO
+@using DocumentProcessor.WebForms.Data
+@using DocumentProcessor.WebForms.Models
+@using DocumentProcessor.WebForms.Services
+@using Microsoft.EntityFrameworkCore
+@using Microsoft.Extensions.Logging
+
+@* TitleContent placeholder of Site.Master *@
+<PageTitle>Document Processor</PageTitle>
+
+<div class="app-grid">
+    <section>
+        @* Web Forms kept the uploader outside the UpdatePanel because a file input cannot be
+           posted asynchronously. InputFile streams over the circuit, so that no longer applies. *@
+        <DocumentUploader @ref="Uploader"
+                          IdPrefix="ctl00_MainContent_Uploader"
+                          NamePrefix="ctl00$MainContent$Uploader"
+                          UploadRequested="Uploader_UploadRequested" />
+    </section>
+
+    <section>
+        @* Was the ListPanel UpdatePanel (UpdateMode=Conditional); Blazor re-renders on state change. *@
+        <div id="ctl00_MainContent_ListPanel">
+            <DocumentList Documents="documents"
+                          IdPrefix="ctl00_MainContent_Documents"
+                          NamePrefix="ctl00$MainContent$Documents"
+                          RefreshRequested="Documents_RefreshRequested"
+                          ViewSummaryRequested="Documents_ViewSummaryRequested"
+                          DeleteRequested="Documents_DeleteRequested" />
+
+            @if (summaryModalVisible)
+            {
+                <div id="ctl00_MainContent_SummaryModal" class="modal fade show d-block modal-backdrop-tint" tabindex="-1">
+                    <div class="modal-dialog">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h6 class="modal-title">@summaryModalTitle</h6>
+                                <a href="#" id="ctl00_MainContent_SummaryModalDismiss" class="btn-close"
+                                   @onclick="CloseSummaryModal_Click" @onclick:preventDefault></a>
+                            </div>
+                            <div class="modal-body">
+                                <p>@summaryModalBody</p>
+                            </div>
+                            <div class="modal-footer">
+                                <a href="#" id="ctl00_MainContent_SummaryModalClose" class="btn btn-sm btn-secondary"
+                                   @onclick="CloseSummaryModal_Click" @onclick:preventDefault>Close</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
+
+            @if (deleteModalVisible)
+            {
+                <div id="ctl00_MainContent_DeleteModal" class="modal fade show d-block modal-backdrop-tint" tabindex="-1">
+                    <div class="modal-dialog modal-sm">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h6 class="modal-title">Delete document?</h6>
+                                <a href="#" id="ctl00_MainContent_DeleteModalDismiss" class="btn-close"
+                                   @onclick="CancelDelete_Click" @onclick:preventDefault></a>
+                            </div>
+                            <div class="modal-body">
+                                <p class="mb-0"><strong>@deleteModalFileName</strong></p>
+                            </div>
+                            <div class="modal-footer">
+                                <a href="#" id="ctl00_MainContent_CancelDeleteButton" class="btn btn-sm btn-secondary"
+                                   @onclick="CancelDelete_Click" @onclick:preventDefault>Cancel</a>
+                                <a href="#" id="ctl00_MainContent_ConfirmDeleteButton" class="btn btn-sm btn-danger"
+                                   @onclick="ConfirmDelete_Click" @onclick:preventDefault>Delete</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
+        </div>
+
+        @* Was the ListProgress UpdateProgress (DisplayAfter=300) bound to the list panel. *@
+        <div id="ctl00_MainContent_ListProgress" style="@(showListProgress ? null : "display:none;")" role="status" aria-hidden="@(showListProgress ? "false" : "true")">
+            <div class="update-progress"><span class="spinner-border"></span></div>
+        </div>
+    </section>
+</div>
+
+@code {
+    private const int MaxDocumentsShown = 50;
+    private const int ListProgressDisplayAfterMilliseconds = 300;
+
+    [Inject] private IDbContextFactory<DocumentDbContext> DbFactory { get; set; } = default!;
+    [Inject] private IDocumentStorage Storage { get; set; } = default!;
+    [Inject] private DocumentPipeline Pipeline { get; set; } = default!;
+    [Inject] private ILogger<Default> Logger { get; set; } = default!;
+
+    private DocumentUploader? Uploader;
+
+    private IList<Document> documents = new List<Document>();
+
+    private bool summaryModalVisible;
+    private string summaryModalTitle = string.Empty;
+    private string summaryModalBody = string.Empty;
+
+    private bool deleteModalVisible;
+    private string deleteModalFileName = string.Empty;
+
+    // Was ViewState["DeleteTargetId"].
+    private Guid? deleteTargetId;
+
+    // Notifications raised before the uploader reference is attached (first render) are
+    // parked here and handed to the uploader once it exists.
+    private readonly List<Notification> pendingNotifications = new List<Notification>();
+
+    private bool showListProgress;
+    private int listBusyCount;
+    private bool disposed;
+
+    protected override async Task OnInitializedAsync()
+    {
+        // Page_Load with !IsPostBack.
+        await LoadDocumentsAsync();
+    }
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        if (Uploader != null && pendingNotifications.Count > 0)
+        {
+            var parked = pendingNotifications.ToList();
+            pendingNotifications.Clear();
+            foreach (var notice in parked)
+            {
+                Uploader.Notify(notice.Text, notice.Level);
+            }
+        }
+    }
+
+    private void Notify(string text, NotificationLevel level)
+    {
+        if (Uploader != null)
+        {
+            Uploader.Notify(text, level);
+        }
+        else
+        {
+            pendingNotifications.Add(new Notification(text, level));
+        }
+    }
+
+    // Web Forms rebuilt the notification list on every postback; clear it at the start of
+    // each list handler to keep that per-request behaviour.
+    private void ClearNotifications()
+    {
+        Uploader?.ClearNotifications();
+        pendingNotifications.Clear();
+    }
+
+    private async Task Uploader_UploadRequested(UploadEventArgs e)
+    {
+        foreach (var file in e.Files)
+        {
+            var name = Path.GetFileName(file.Name);
+
+            try
+            {
+                var document = await StoreAsync(e, file, name);
+
+                // Summarizing runs before the handler returns, so the uploader stays busy
+                // until Bedrock has answered (as the full postback did).
+                await Pipeline.ProcessAsync(document.Id);
+
+                Notify(string.Format("'{0}' processed", name), NotificationLevel.Success);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Upload failed for {FileName}.", name);
+                Notify(string.Format("'{0}' failed to upload", name), NotificationLevel.Danger);
+            }
+        }
+
+        await LoadDocumentsAsync();
+    }
+
+    private async Task Documents_RefreshRequested()
+    {
+        await RunListActionAsync(async () =>
+        {
+            ClearNotifications();
+            await LoadDocumentsAsync();
+        });
+    }
+
+    private async Task Documents_ViewSummaryRequested(DocumentEventArgs e)
+    {
+        await RunListActionAsync(async () =>
+        {
+            ClearNotifications();
+            var document = await FindAsync(e.DocumentId);
+
+            if (document == null)
+            {
+                Notify("That document is no longer available.", NotificationLevel.Warning);
+                await LoadDocumentsAsync();
+                return;
+            }
+
+            // Razor encodes on output, replacing Server.HtmlEncode + Literal.
+            summaryModalTitle = document.OriginalFileName ?? string.Empty;
+            summaryModalBody = document.Summary ?? string.Empty;
+            summaryModalVisible = true;
+        });
+    }
+
+    private void CloseSummaryModal_Click()
+    {
+        ClearNotifications();
+        summaryModalVisible = false;
+    }
+
+    private async Task Documents_DeleteRequested(DocumentEventArgs e)
+    {
+        await RunListActionAsync(async () =>
+        {
+            ClearNotifications();
+            var document = await FindAsync(e.DocumentId);
+
+            if (document == null)
+            {
+                Notify("That document is no longer available.", NotificationLevel.Warning);
+                await LoadDocumentsAsync();
+                return;
+            }
+
+            deleteTargetId = document.Id;
+            deleteModalFileName = document.OriginalFileName ?? string.Empty;
+            deleteModalVisible = true;
+        });
+    }
+
+    private void CancelDelete_Click()
+    {
+        ClearNotifications();
+        deleteTargetId = null;
+        deleteModalVisible = false;
+    }
+
+    private async Task ConfirmDelete_Click()
+    {
+        await RunListActionAsync(async () =>
+        {
+            ClearNotifications();
+
+            if (deleteTargetId is not Guid documentId)
+            {
+                deleteModalVisible = false;
+                return;
+            }
+
+            try
+            {
+                // Soft delete: the DbContext query filter (and this condition) excludes IsDeleted rows.
+                await using (var db = await DbFactory.CreateDbContextAsync())
+                {
+                    var document = await db.Documents.FirstOrDefaultAsync(d => d.Id == documentId && !d.IsDeleted);
+
+                    if (document != null)
+                    {
+                        document.IsDeleted = true;
+                        await db.SaveChangesAsync();
+                    }
+                }
+
+                deleteTargetId = null;
+                deleteModalVisible = false;
+                await LoadDocumentsAsync();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Delete failed for document {DocumentId}.", documentId);
+                Notify("Could not delete the document.", NotificationLevel.Danger);
+            }
+        });
+    }
+
+    private async Task LoadDocumentsAsync()
+    {
+        try
+        {
+            await using var db = await DbFactory.CreateDbContextAsync();
+            documents = await db.Documents
+                .AsNoTracking()
+                .Where(d => !d.IsDeleted)
+                .OrderByDescending(d => d.UploadedAt)
+                .Take(MaxDocumentsShown)
+                .ToListAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Could not load documents.");
+            documents = new List<Document>();
+            Notify("Could not load documents.", NotificationLevel.Danger);
+        }
+    }
+
+    private async Task<Document?> FindAsync(Guid documentId)
+    {
+        await using var db = await DbFactory.CreateDbContextAsync();
+        return await db.Documents
+            .AsNoTracking()
+            .FirstOrDefaultAsync(d => d.Id == documentId && !d.IsDeleted);
+    }
+
+    private async Task<Document> StoreAsync(UploadEventArgs e, IBrowserFile file, string name)
+    {
+        var document = new Document
+        {
+            FileName = name,
+            OriginalFileName = name,
+            FileExtension = Path.GetExtension(name).ToLowerInvariant(),
+            ContentType = file.ContentType,
+            FileSize = file.Size,
+            UploadedAt = DateTimeOffset.UtcNow,
+            Status = DocumentStatus.Pending
+        };
+
+        // The browser file stream only supports asynchronous reads, and IDocumentStorage.Save
+        // reads synchronously, so buffer the upload into a temporary file first (keeps a
+        // 50 MB upload off the managed heap).
+        var tempPath = Path.GetTempFileName();
+        try
+        {
+            await using (var buffer = new FileStream(tempPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 81920, FileOptions.Asynchronous))
+            {
+                await using (var upload = e.OpenReadStream(file))
+                {
+                    await upload.CopyToAsync(buffer);
+                }
+
+                buffer.Position = 0;
+                document.StoragePath = Storage.Save(buffer, name);
+            }
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(tempPath);
+            }
+            catch (IOException ex)
+            {
+                Logger.LogWarning(ex, "Could not delete temporary upload buffer {TempPath}.", tempPath);
+            }
+        }
+
+        await using (var db = await DbFactory.CreateDbContextAsync())
+        {
+            db.Documents.Add(document);
+            await db.SaveChangesAsync();
+        }
+
+        return document;
+    }
+
+    // Reproduces the UpdateProgress: the spinner shows only if the list action takes
+    // longer than DisplayAfter (300 ms).
+    private async Task RunListActionAsync(Func<Task> action)
+    {
+        listBusyCount++;
+        _ = ShowListProgressAfterDelayAsync();
+
+        try
+        {
+            await action();
+        }
+        finally
+        {
+            listBusyCount--;
+            if (listBusyCount == 0)
+            {
+                showListProgress = false;
+            }
+        }
+    }
+
+    private async Task ShowListProgressAfterDelayAsync()
+    {
+        await Task.Delay(ListProgressDisplayAfterMilliseconds);
+
+        if (disposed || listBusyCount == 0)
+        {
+            return;
+        }
+
+        await InvokeAsync(() =>
+        {
+            if (!disposed && listBusyCount > 0)
+            {
+                showListProgress = true;
+                StateHasChanged();
+            }
+        });
+    }
+
+    public void Dispose()
+    {
+        disposed = true;
+    }
+}
